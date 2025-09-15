@@ -14,7 +14,7 @@ def tcp_connect(host: str, port: int, timeout=5.0) -> socket.socket:
     """Prefer IPv4, then try IPv6; short per-attempt timeout; raise last error."""
     families = (socket.AF_INET, socket.AF_INET6)
     last_err = None
-    per_try = min(timeout, 3.0)
+    per_try = min(timeout, 10.0)
     for fam in families:
         try:
             infos = socket.getaddrinfo(host, port, fam, socket.SOCK_STREAM)
