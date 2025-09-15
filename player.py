@@ -7,6 +7,7 @@ from game_logic import TicTacToeRecycling
 
 UNUSABLE_HOSTS = {"0.0.0.0", "127.0.0.1", "::", "localhost", "", None}
 
+
 def outbound_ip_to(peer_host: str) -> str | None:
     """Return the local IP the OS would use to reach peer_host (IPv4)."""
     try:
