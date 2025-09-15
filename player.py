@@ -326,7 +326,7 @@ def cmd_invite(username: str, target_host: str, target_port: int,
                tcp_bind_host: str, tcp_port: int, tcp_advertise_host: str | None):
     print(f"[Invite] Sending INVITE to {target_host}:{target_port} ...")
     ok, addr, resp = udp_send_and_wait(target_host, target_port,
-                                       {"type":"INVITE","from":username}, timeout=3.0)
+                                       {"type":"INVITE","from":username}, timeout=10.0)
     if not ok or not resp:
         print("[Invite] Declined or timeout.")
         return
