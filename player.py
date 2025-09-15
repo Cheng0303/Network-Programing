@@ -7,6 +7,21 @@ from game_logic import TicTacToeRecycling
 
 UNUSABLE_HOSTS = {"0.0.0.0", "127.0.0.1", "::", "localhost", "", None}
 
+def outbound_ip_to(peer_host: str) -> str | None:
+    """Return the local IP the OS would use to reach peer_host (IPv4)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 連到任意 UDP port（例如 9/Discard），只是為了讓 kernel 選路由
+        s.connect((peer_host, 9))
+        ip = s.getsockname()[0]
+    except OSError:
+        ip = None
+    finally:
+        try: s.close()
+        except: pass
+    return ip
+
+
 def is_unusable_host(h: Optional[str]) -> bool:
     return h in UNUSABLE_HOSTS
 
@@ -151,21 +166,28 @@ def cmd_wait(username: str, udp_port: int, auto_accept=False):
         else:
             pass
 
-def run_host(username: str, bind_host: str, tcp_port: int, peer_udp: Tuple[str,int], advertise_host: Optional[str]=None):
+def run_host(username: str, bind_host: str, tcp_port: int,
+             peer_udp: Tuple[str,int], advertise_host: str | None = None):
     """Host side: listen TCP, then tell guest how to reach us via UDP (GAME_TCP)."""
-    # TCP server
+
     serv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     serv.bind((bind_host, tcp_port))
     serv.listen(1)
     print(f"[Host] TCP listening on {bind_host}:{tcp_port}")
 
-    # Decide what host to advertise to the peer (不要用 0.0.0.0/localhost)
-    adv_host = advertise_host or bind_host
-    if is_unusable_host(adv_host):
-        adv_host = peer_udp[0]  # 用對方看到的我們的來源 IP
 
-    # notify peer via UDP（回到對方剛剛回覆 INVITE 的來源）
+    adv_host = advertise_host
+    if not adv_host or adv_host in ("0.0.0.0", "127.0.0.1", "::", "localhost"):
+
+        guess = outbound_ip_to(peer_udp[0])
+        if guess:
+            adv_host = guess
+        else:
+
+            adv_host = bind_host
+
+
     uh, up = peer_udp
     us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     us.sendto(json.dumps({"type":"GAME_TCP","host":adv_host,"port":tcp_port}).encode("utf-8"), (uh, up))
@@ -175,9 +197,7 @@ def run_host(username: str, bind_host: str, tcp_port: int, peer_udp: Tuple[str,i
     conn, addr = serv.accept()
     print(f"[Host] Peer connected from {addr}")
 
-    # Game
     game = TicTacToeRecycling()
-    # host is 'X' and starts
     start_msg = {"type":"WELCOME","mark":"X","first":"X","rule":"recycle-3"}
     conn.sendall((json.dumps(start_msg)+"\n").encode("utf-8"))
     print("[Game] You are 'X'. You go first.")
@@ -189,7 +209,6 @@ def run_host(username: str, bind_host: str, tcp_port: int, peer_udp: Tuple[str,i
             if not ok:
                 print("[Game] Illegal move:", info)
                 continue
-            # send state to peer
             send_line(conn, {"type":"STATE","board":game.board_str(),"turn":game.turn,"last":pos,"recycled":info.get("recycled")})
             if info.get("winner"):
                 send_line(conn, {"type":"GAME_OVER","winner":"X"})
@@ -197,7 +216,6 @@ def run_host(username: str, bind_host: str, tcp_port: int, peer_udp: Tuple[str,i
                 print("[Game] You WIN!")
                 break
         else:
-            # Peer turn
             send_line(conn, {"type":"YOUR_TURN"})
             msg = recv_json(conn)
             if not msg:
@@ -219,6 +237,7 @@ def run_host(username: str, bind_host: str, tcp_port: int, peer_udp: Tuple[str,i
                 break
     conn.close()
     serv.close()
+
 
 # ---------- line/json helpers ----------
 
@@ -302,19 +321,28 @@ def prompt_move_guest() -> int:
 
 # ---------- CLI ----------
 
-def cmd_invite(username: str, target_host: str, target_port: int, tcp_bind_host: str, tcp_port: int, tcp_advertise_host: Optional[str]):
+def cmd_invite(username: str, target_host: str, target_port: int,
+               tcp_bind_host: str, tcp_port: int, tcp_advertise_host: str | None):
     print(f"[Invite] Sending INVITE to {target_host}:{target_port} ...")
-    ok, addr, resp = udp_send_and_wait(target_host, target_port, {"type":"INVITE","from":username}, timeout=3.0)
+    ok, addr, resp = udp_send_and_wait(target_host, target_port,
+                                       {"type":"INVITE","from":username}, timeout=3.0)
     if not ok or not resp:
         print("[Invite] Declined or timeout.")
         return
     if resp.get("type")=="INVITE_REPLY" and resp.get("decision")=="ACCEPT":
         print("[Invite] Accepted. Hosting TCP...")
-        # 用「對方回 INVITE 的來源位址」作為後續回報的 UDP 目標，避免 hostname/NAT 造成偏差
+
+
+        adv_host = tcp_advertise_host
+        if not adv_host or adv_host in ("0.0.0.0", "127.0.0.1", "::", "localhost"):
+            guess = outbound_ip_to(target_host)
+            if guess: adv_host = guess
+
         peer_udp = addr if addr else (target_host, target_port)
-        run_host(username, tcp_bind_host, tcp_port, peer_udp, advertise_host=tcp_advertise_host)
+        run_host(username, tcp_bind_host, tcp_port, peer_udp, advertise_host=adv_host)
     else:
         print("[Invite] Declined:", resp)
+
 
 def main():
     ap = argparse.ArgumentParser(description="Player client (login/scan/wait/invite/game)")
