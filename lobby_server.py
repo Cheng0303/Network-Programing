@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
 """
 
 def hash_password(password: str, salt: str) -> str:
-    # PBKDF2 could be better; keep simple stdlib SHA256 with salt
+    
     return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
 
 class LobbyDB:
