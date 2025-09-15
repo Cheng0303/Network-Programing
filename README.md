@@ -94,14 +94,3 @@ Enter the cell number on your turn. The host (`Alice`, mark `X`) is authoritativ
 - A ↔ B: `{"type":"YOUR_TURN"}` / `{"type":"MOVE","pos":4}` / `{"type":"STATE","board":"X O ...","turn":"O","recycled":0}`
 - A ↔ B: `{"type":"GAME_OVER","winner":"X"|"O"}`
 
-## Notes
-
-- No third-party packages are required.
-- Passwords are stored as salted SHA-256 hashes (stdlib). For production, use a stronger KDF.
-- A is authoritative in-game to avoid divergence.
-
-## Known Limitations / TODOs
-
-- UDP scanning is sequential (simple). You can add threads to speed up large ranges.
-- NAT traversal is out of scope. Provide a reachable `--tcp-bind-host` for B to connect back.
-- Minimal error handling; extend as needed for your report.
