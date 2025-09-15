@@ -26,11 +26,12 @@ def outbound_ip_to(peer_host: str) -> str | None:
 def is_unusable_host(h: Optional[str]) -> bool:
     return h in UNUSABLE_HOSTS
 
+import time, socket
+
 def tcp_connect(host: str, port: int, timeout=5.0) -> socket.socket:
-    """Prefer IPv4, then try IPv6; short per-attempt timeout; raise last error."""
     families = (socket.AF_INET, socket.AF_INET6)
     last_err = None
-    per_try = min(timeout, 10.0)
+    deadline = time.monotonic() + timeout
     for fam in families:
         try:
             infos = socket.getaddrinfo(host, port, fam, socket.SOCK_STREAM)
@@ -38,15 +39,22 @@ def tcp_connect(host: str, port: int, timeout=5.0) -> socket.socket:
             last_err = e
             continue
         for *_, addr in infos:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            per_try = max(0.5, min(3.0, remaining))     # 每次嘗試上限 3s
             s = socket.socket(fam, socket.SOCK_STREAM)
             s.settimeout(per_try)
             try:
                 s.connect(addr)
+                s.settimeout(None)                      # ★ 改回阻塞
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 return s
             except OSError as e:
                 last_err = e
                 s.close()
     raise (last_err or TimeoutError(f"connect to {host}:{port} failed"))
+
 
 def tcp_request(host: str, port: int, msg: dict) -> dict:
     s = tcp_connect(host, port)
