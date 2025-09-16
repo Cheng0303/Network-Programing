@@ -1,60 +1,14 @@
+
 import argparse, socket, json, time, threading, random, sys
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 from protocol import send_json, recv_json, pretty_board
 from game_logic import TicTacToeRecycling
 
-# ---------- helpers ----------
-
-UNUSABLE_HOSTS = {"0.0.0.0", "127.0.0.1", "::", "localhost", "", None}
-
-
-def outbound_ip_to(peer_host: str) -> str | None:
-    """Return the local IP the OS would use to reach peer_host (IPv4)."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # 連到任意 UDP port（例如 9/Discard），只是為了讓 kernel 選路由
-        s.connect((peer_host, 9))
-        ip = s.getsockname()[0]
-    except OSError:
-        ip = None
-    finally:
-        try: s.close()
-        except: pass
-    return ip
-
-
-def is_unusable_host(h: Optional[str]) -> bool:
-    return h in UNUSABLE_HOSTS
-
-import time, socket
-
 def tcp_connect(host: str, port: int, timeout=5.0) -> socket.socket:
-    families = (socket.AF_INET, socket.AF_INET6)
-    last_err = None
-    deadline = time.monotonic() + timeout
-    for fam in families:
-        try:
-            infos = socket.getaddrinfo(host, port, fam, socket.SOCK_STREAM)
-        except OSError as e:
-            last_err = e
-            continue
-        for *_, addr in infos:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            per_try = max(0.5, min(3.0, remaining))     # 每次嘗試上限 3s
-            s = socket.socket(fam, socket.SOCK_STREAM)
-            s.settimeout(per_try)
-            try:
-                s.connect(addr)
-                s.settimeout(None)                      # ★ 改回阻塞
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                return s
-            except OSError as e:
-                last_err = e
-                s.close()
-    raise (last_err or TimeoutError(f"connect to {host}:{port} failed"))
-
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect((host, port))
+    return s
 
 def tcp_request(host: str, port: int, msg: dict) -> dict:
     s = tcp_connect(host, port)
@@ -62,8 +16,6 @@ def tcp_request(host: str, port: int, msg: dict) -> dict:
     resp = recv_json(s)
     s.close()
     return resp
-
-# ---------- lobby ops ----------
 
 def lobby_register(lobby_host, lobby_port, username, password):
     resp = tcp_request(lobby_host, lobby_port, {"type":"REGISTER","username":username,"password":password})
@@ -73,7 +25,19 @@ def lobby_login(lobby_host, lobby_port, username, password):
     resp = tcp_request(lobby_host, lobby_port, {"type":"LOGIN","username":username,"password":password})
     print("[Lobby]", resp)
 
-# ---------- parsing ----------
+def lobby_logout(lobby_host, lobby_port, username):
+    try:
+        resp = tcp_request(lobby_host, lobby_port, {"type":"LOGOUT","username":username})
+        print("[Lobby]", resp)
+    except Exception as e:
+        print("[Lobby] LOGOUT failed:", e)
+
+def lobby_report(lobby_host, lobby_port, username, xp=0, coins=0):
+    try:
+        resp = tcp_request(lobby_host, lobby_port, {"type":"REPORT","username":username,"stats":{"xp":xp,"coins":coins}})
+        print("[Lobby]", resp)
+    except Exception as e:
+        print("[Lobby] REPORT failed:", e)
 
 def parse_hostport(s: str) -> Tuple[str,int]:
     if ":" not in s:
@@ -89,9 +53,7 @@ def parse_ports(pstr: str) -> List[int]:
     else:
         return [int(pstr)]
 
-# ---------- UDP util ----------
-
-def udp_send_and_wait(dst_host, dst_port, payload: dict, timeout=0.3) -> Tuple[bool, Tuple[str,int] or None, dict or None]:
+def udp_send_and_wait(dst_host, dst_port, payload: dict, timeout=0.3):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
     try:
@@ -102,8 +64,6 @@ def udp_send_and_wait(dst_host, dst_port, payload: dict, timeout=0.3) -> Tuple[b
         return False, None, None
     finally:
         s.close()
-
-# ---------- scan/wait/invite ----------
 
 def cmd_scan(hosts: List[str], ports: List[int], timeout=0.15):
     print(f"[Scan] Targets={len(hosts)} hosts × {len(ports)} ports")
@@ -119,136 +79,157 @@ def cmd_scan(hosts: List[str], ports: List[int], timeout=0.15):
     return discovered
 
 def cmd_wait(username: str, udp_port: int, auto_accept=False):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", udp_port))
-    print(f"[Wait] {username} waiting on UDP {udp_port} ...")
+    """
+    Wait for invites on UDP. After a finished game session, automatically return to waiting.
+    """
     while True:
-        data, addr = s.recvfrom(4096)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            msg = json.loads(data.decode("utf-8"))
+            s.bind(("0.0.0.0", udp_port))
+        except OSError as e:
+            print(f"[Wait] UDP {udp_port} busy ({e}), trying next port ...")
+            udp_port += 1
+            s.bind(("0.0.0.0", udp_port))
+            print(f"[Wait] Now listening on UDP {udp_port}")
+        print(f"[Wait] {username} waiting on UDP {udp_port} ...")
+        tcp_target = None
+        while True:
+            try:
+                data, addr = s.recvfrom(4096)
+            except Exception as e:
+                print(f"[Wait] recv error: {e}")
+                break
+            try:
+                msg = json.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+            t = msg.get("type")
+            if t == "DISCOVER":
+                resp = {"type":"DISCOVER_ACK","player":username,"udp_port":udp_port}
+                s.sendto(json.dumps(resp).encode("utf-8"), addr)
+            elif t == "INVITE":
+                print(f"[Wait] INVITE from {addr}: {msg}")
+                decision = "ACCEPT" if auto_accept else (input("Accept invitation? [y/N] ").strip().lower()=="y")
+                if decision == True:
+                    decision = "ACCEPT"
+                elif decision == False:
+                    decision = "DECLINE"
+                elif decision not in ("ACCEPT","DECLINE"):
+                    decision = "DECLINE"
+                s.sendto(json.dumps({"type":"INVITE_REPLY","decision":decision}).encode("utf-8"), addr)
+                if decision == "ACCEPT":
+                    print("[Wait] Accepted. Waiting for GAME_TCP ...")
+                    while True:
+                        s.settimeout(10.0)
+                        try:
+                            data2, addr2 = s.recvfrom(4096)
+                        except socket.timeout:
+                            print("[Wait] Timeout waiting for GAME_TCP. Back to waiting for invites.")
+                            s.settimeout(None)
+                            break
+                        try:
+                            msg2 = json.loads(data2.decode("utf-8"))
+                        except Exception:
+                            continue
+                        if msg2.get("type") == "GAME_TCP":
+                            tcp_target = (msg2.get("host"), int(msg2.get("port")))
+                            print(f"[Wait] Got TCP target: {tcp_target}")
+                            s.close()
+                            run_guest(username, tcp_target[0], tcp_target[1])
+                            break
+                    break
+            else:
+                pass
+        # close and restart waiting
+        try:
+            s.close()
         except Exception:
-            continue
-        t = msg.get("type")
-        if t == "DISCOVER":
-            resp = {"type":"DISCOVER_ACK","player":username,"udp_port":udp_port}
-            s.sendto(json.dumps(resp).encode("utf-8"), addr)
-
-        elif t == "INVITE":
-            print(f"[Wait] INVITE from {addr}: {msg}")
-            decision = "ACCEPT" if auto_accept else (input("Accept invitation? [y/N] ").strip().lower()=="y")
-            if decision is True:
-                decision = "ACCEPT"
-            elif decision is False:
-                decision = "DECLINE"
-            elif decision not in ("ACCEPT","DECLINE"):
-                decision = "DECLINE"
-            s.sendto(json.dumps({"type":"INVITE_REPLY","decision":decision}).encode("utf-8"), addr)
-            if decision == "ACCEPT":
-                inviter_ip = addr[0]  # 記住對方的來源 IP（保底用）
-                print("[Wait] Accepted. Waiting for GAME_TCP ...")
-                # wait for GAME_TCP
-                while True:
-                    s.settimeout(10.0)
-                    try:
-                        data2, addr2 = s.recvfrom(4096)
-                    except socket.timeout:
-                        print("[Wait] Timeout waiting for GAME_TCP. Back to waiting for invites.")
-                        s.settimeout(None)
-                        break
-                    try:
-                        msg2 = json.loads(data2.decode("utf-8"))
-                    except Exception:
-                        continue
-                    if msg2.get("type") == "GAME_TCP":
-                        host = msg2.get("host")
-                        port = int(msg2.get("port"))
-                        # 若對方送了 0.0.0.0/localhost，就用對方的來源 IP 當連線目標
-                        if is_unusable_host(host):
-                            # 先用邀請者 IP（更可信），退而求其次用這包訊息的來源 IP
-                            host = inviter_ip or addr2[0]
-                        tcp_target = (host, port)
-                        print(f"[Wait] Got TCP target: {tcp_target}")
-                        s.close()
-                        run_guest(username, tcp_target[0], tcp_target[1])
-                        return
-        else:
             pass
 
-def run_host(username: str, bind_host: str, tcp_port: int,
-             peer_udp: Tuple[str,int], advertise_host: str | None = None):
-    """Host side: listen TCP, then tell guest how to reach us via UDP (GAME_TCP)."""
-
+def run_host(username: str, bind_host: str, tcp_port: int, peer_udp: Tuple[str,int]):
+    """
+    Host a TCP server for the game. If the requested tcp_port is busy, automatically
+    fall back to an ephemeral port (0) and print the new state. Send the actual port
+    via UDP GAME_TCP to the peer.
+    """
+    # TCP server with port-conflict handling
     serv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    serv.bind((bind_host, tcp_port))
+    try:
+        serv.bind((bind_host, tcp_port))
+    except OSError as e:
+        print(f"[Host] Port {tcp_port} busy ({e}). Falling back to ephemeral port 0.")
+        serv.bind((bind_host, 0))  # let OS choose a free port
     serv.listen(1)
-    print(f"[Host] TCP listening on {bind_host}:{tcp_port}")
-
-
-    adv_host = advertise_host
-    if not adv_host or adv_host in ("0.0.0.0", "127.0.0.1", "::", "localhost"):
-
-        guess = outbound_ip_to(peer_udp[0])
-        if guess:
-            adv_host = guess
-        else:
-
-            adv_host = bind_host
-
-
+    actual_port = serv.getsockname()[1]
+    print(f"[Host] TCP listening on {bind_host}:{actual_port}")
+    # notify peer via UDP (send actual port)
     uh, up = peer_udp
     us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    us.sendto(json.dumps({"type":"GAME_TCP","host":adv_host,"port":tcp_port}).encode("utf-8"), (uh, up))
+    us.sendto(json.dumps({"type":"GAME_TCP","host":bind_host,"port":actual_port}).encode("utf-8"), (uh, up))
     us.close()
-    print(f"[Host] Advertised TCP target: {adv_host}:{tcp_port}")
-
-    conn, addr = serv.accept()
+    # Accept a single peer
+    try:
+        conn, addr = serv.accept()
+    except Exception as e:
+        print(f"[Host] Accept failed: {e}")
+        serv.close()
+        return
     print(f"[Host] Peer connected from {addr}")
-
+    # Game
     game = TicTacToeRecycling()
+    # host is 'X' and starts
     start_msg = {"type":"WELCOME","mark":"X","first":"X","rule":"recycle-3"}
     conn.sendall((json.dumps(start_msg)+"\n").encode("utf-8"))
     print("[Game] You are 'X'. You go first.")
-    while True:
-        if game.turn == "X":
-            print(pretty_board(game.board_str()))
-            pos = prompt_move(game)
-            ok, info = game.apply_move("X", pos)
-            if not ok:
-                print("[Game] Illegal move:", info)
-                continue
-            send_line(conn, {"type":"STATE","board":game.board_str(),"turn":game.turn,"last":pos,"recycled":info.get("recycled")})
-            if info.get("winner"):
-                send_line(conn, {"type":"GAME_OVER","winner":"X"})
+    try:
+        while True:
+            if game.turn == "X":
                 print(pretty_board(game.board_str()))
-                print("[Game] You WIN!")
-                break
-        else:
-            send_line(conn, {"type":"YOUR_TURN"})
-            msg = recv_json(conn)
-            if not msg:
-                print("[Host] Peer disconnected.")
-                break
-            if msg.get("type") != "MOVE":
-                print("[Host] Unexpected:", msg)
-                continue
-            pos = int(msg.get("pos"))
-            ok, info = game.apply_move("O", pos)
-            if not ok:
-                send_line(conn, {"type":"ERROR","reason":info.get("reason","illegal")})
-                continue
-            send_line(conn, {"type":"STATE","board":game.board_str(),"turn":game.turn,"last":pos,"recycled":info.get("recycled")})
-            if info.get("winner"):
-                send_line(conn, {"type":"GAME_OVER","winner":"O"})
-                print(pretty_board(game.board_str()))
-                print("[Game] You LOSE.")
-                break
-    conn.close()
-    serv.close()
-
-
-# ---------- line/json helpers ----------
+                pos = prompt_move(game)
+                ok, info = game.apply_move("X", pos)
+                if not ok:
+                    print("[Game] Illegal move:", info)
+                    continue
+                # send state to peer
+                send_line(conn, {"type":"STATE","board":game.board_str(),"turn":game.turn,"last":pos,"recycled":info.get("recycled")})
+                if info.get("winner"):
+                    send_line(conn, {"type":"GAME_OVER","winner":"X"})
+                    print(pretty_board(game.board_str()))
+                    print("[Game] You WIN!")
+                    break
+            else:
+                # Peer turn
+                send_line(conn, {"type":"YOUR_TURN"})
+                msg = recv_json(conn)
+                if not msg:
+                    print("[Host] Peer disconnected.")
+                    break
+                if msg.get("type") != "MOVE":
+                    print("[Host] Unexpected:", msg)
+                    continue
+                try:
+                    pos = int(msg.get("pos"))
+                except Exception:
+                    send_line(conn, {"type":"ERROR","reason":"bad_pos"})
+                    continue
+                ok, info = game.apply_move("O", pos)
+                if not ok:
+                    send_line(conn, {"type":"ERROR","reason":info.get("reason","illegal")})
+                    continue
+                send_line(conn, {"type":"STATE","board":game.board_str(),"turn":game.turn,"last":pos,"recycled":info.get("recycled")})
+                if info.get("winner"):
+                    send_line(conn, {"type":"GAME_OVER","winner":"O"})
+                    print(pretty_board(game.board_str()))
+                    print("[Game] You LOSE.")
+                    break
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        serv.close()
 
 def send_line(sock, obj):
     sock.sendall((json.dumps(obj)+"\n").encode("utf-8"))
@@ -264,8 +245,6 @@ def recv_line(sock):
         buf.append(b)
     return b"".join(buf).decode("utf-8") if buf else ""
 
-# ---------- gameplay ----------
-
 def prompt_move(game: TicTacToeRecycling) -> int:
     while True:
         raw = input("Your move (0-8; positions are):\n 0 1 2\n 3 4 5\n 6 7 8\n> ").strip()
@@ -279,7 +258,6 @@ def prompt_move(game: TicTacToeRecycling) -> int:
         print("Illegal cell. Try again.")
 
 def run_guest(username: str, host: str, port: int):
-    print(f"[Guest] Connecting to {host}:{port} ...")
     s = tcp_connect(host, port)
     # wait for WELCOME
     msg = recv_json(s)
@@ -287,7 +265,7 @@ def run_guest(username: str, host: str, port: int):
         print("[Guest] Bad welcome:", msg)
         s.close()
         return
-    print(f"[Game] You are 'O'. Host is 'X'. Rule: recycle-3. First: {msg.get('first','X')}")
+    print(f"[Game] You are 'O'. Host is 'X'. Rule: recycle-3.")
     while True:
         msg = recv_json(s)
         if not msg:
@@ -328,33 +306,51 @@ def prompt_move_guest() -> int:
             return pos
         print("Out of range 0-8.")
 
-# ---------- CLI ----------
-
-def cmd_invite(username: str, target_host: str, target_port: int,
-               tcp_bind_host: str, tcp_port: int, tcp_advertise_host: str | None):
+def cmd_invite(username: str, target_host: str, target_port: int, tcp_bind_host: str, tcp_port: int):
     print(f"[Invite] Sending INVITE to {target_host}:{target_port} ...")
-    ok, addr, resp = udp_send_and_wait(target_host, target_port,
-                                       {"type":"INVITE","from":username}, timeout=10.0)
+    ok, addr, resp = udp_send_and_wait(target_host, target_port, {"type":"INVITE","from":username}, timeout=3.0)
     if not ok or not resp:
         print("[Invite] Declined or timeout.")
         return
     if resp.get("type")=="INVITE_REPLY" and resp.get("decision")=="ACCEPT":
         print("[Invite] Accepted. Hosting TCP...")
-
-
-        adv_host = tcp_advertise_host
-        if not adv_host or adv_host in ("0.0.0.0", "127.0.0.1", "::", "localhost"):
-            guess = outbound_ip_to(target_host)
-            if guess: adv_host = guess
-
-        peer_udp = addr if addr else (target_host, target_port)
-        run_host(username, tcp_bind_host, tcp_port, peer_udp, advertise_host=adv_host)
+        run_host(username, tcp_bind_host, tcp_port, (target_host, target_port))
     else:
         print("[Invite] Declined:", resp)
 
+def cmd_match(username: str, hosts: List[str], ports: List[int], tcp_bind_host: str, tcp_port: int, timeout: float):
+    """
+    Auto-match loop: scan available players, try to invite one by one.
+    If declined/timeout, keep trying others; after each finished game, continue scanning.
+    """
+    tried_recent = set()
+    print("[Match] Auto-match started. Ctrl+C to stop.")
+    while True:
+        candidates = cmd_scan(hosts, ports, timeout=timeout)
+        targets = [f"{c['host']}:{c['port']}" for c in candidates]
+        targets = [t for t in targets if t not in tried_recent]
+        if not targets:
+            tried_recent.clear()
+            time.sleep(0.5)
+            continue
+        for t in targets:
+            th, tp = parse_hostport(t)
+            print(f"[Match] Trying invite -> {t}")
+            ok, addr, resp = udp_send_and_wait(th, tp, {"type":"INVITE","from":username}, timeout=3.0)
+            tried_recent.add(t)
+            if not ok or not resp:
+                print(f"[Match] {t} no response/timeout.")
+                continue
+            if resp.get("type")=="INVITE_REPLY" and resp.get("decision")=="ACCEPT":
+                print(f"[Match] Accepted by {t}. Hosting TCP...")
+                run_host(username, tcp_bind_host, tcp_port, (th, tp))
+                # after game finishes, break to rescan again
+                break
+            else:
+                print(f"[Match] Declined by {t}.")
 
 def main():
-    ap = argparse.ArgumentParser(description="Player client (login/scan/wait/invite/game)")
+    ap = argparse.ArgumentParser(description="Player client (login/scan/wait/invite/match/game)")
     ap.add_argument("--lobby", help="host:port of lobby", default=None)
     ap.add_argument("--username", "--name", dest="username", required=True)
     ap.add_argument("--password", help="password for lobby ops", default=None)
@@ -362,6 +358,10 @@ def main():
 
     sreg = sub.add_parser("register")
     slog = sub.add_parser("login")
+    slogout = sub.add_parser("logout")
+    sreport = sub.add_parser("report")
+    sreport.add_argument("--xp", type=int, default=0)
+    sreport.add_argument("--coins", type=int, default=0)
 
     swait = sub.add_parser("wait")
     swait.add_argument("--udp-port", type=int, required=True)
@@ -372,21 +372,25 @@ def main():
     sscan.add_argument("--ports", default="10001-10020")
     sscan.add_argument("--timeout", type=float, default=0.15)
 
+    smatch = sub.add_parser("match")
+    smatch.add_argument("--hosts", default="linux1.cs.nycu.edu.tw,linux2.cs.nycu.edu.tw,linux3.cs.nycu.edu.tw,linux4.cs.nycu.edu.tw")
+    smatch.add_argument("--ports", default="10001-10020")
+    smatch.add_argument("--timeout", type=float, default=0.15)
+    smatch.add_argument("--tcp-bind-host", default="0.0.0.0")
+    smatch.add_argument("--tcp-port", type=int, default=5001)
+
     sinv = sub.add_parser("invite")
     sinv.add_argument("--target", required=True, help="host:udp_port")
-    sinv.add_argument("--tcp-bind-host", default="0.0.0.0", help="listen host/IP (0.0.0.0 to listen on all)")
+    sinv.add_argument("--tcp-bind-host", default="0.0.0.0", help="host/IP to bind and share back to guest")
     sinv.add_argument("--tcp-port", type=int, default=5001)
-    sinv.add_argument("--tcp-advertise-host", default=None,
-                      help="host/IP to tell the peer to connect to; "
-                           "omit to auto-use the IP seen by the peer")
 
     args = ap.parse_args()
 
     # lobby host:port parse if needed
     lobby_host = lobby_port = None
-    if args.cmd in ("register","login"):
+    if args.cmd in ("register","login","logout","report"):
         if not args.lobby:
-            print("Use --lobby host:port for register/login")
+            print("Use --lobby host:port for this command")
             sys.exit(1)
         lobby_host, lobby_port = parse_hostport(args.lobby)
 
@@ -402,6 +406,12 @@ def main():
             sys.exit(1)
         lobby_login(lobby_host, lobby_port, args.username, args.password)
 
+    elif args.cmd == "logout":
+        lobby_logout(lobby_host, lobby_port, args.username)
+
+    elif args.cmd == "report":
+        lobby_report(lobby_host, lobby_port, args.username, xp=args.xp, coins=args.coins)
+
     elif args.cmd == "wait":
         cmd_wait(args.username, args.udp_port, auto_accept=args.auto_accept)
 
@@ -412,7 +422,12 @@ def main():
 
     elif args.cmd == "invite":
         th, tp = parse_hostport(args.target)
-        cmd_invite(args.username, th, tp, args.tcp_bind_host, args.tcp_port, args.tcp_advertise_host)
+        cmd_invite(args.username, th, tp, args.tcp_bind_host, args.tcp_port)
+
+    elif args.cmd == "match":
+        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+        ports = parse_ports(args.ports)
+        cmd_match(args.username, hosts, ports, args.tcp_bind_host, args.tcp_port, args.timeout)
 
 if __name__ == "__main__":
     main()

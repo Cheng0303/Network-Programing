@@ -13,7 +13,6 @@ def recv_line(sock: socket.socket) -> str:
     while True:
         chunk = sock.recv(1)
         if not chunk:
-            # connection closed
             break
         if chunk == b"\n":
             break
