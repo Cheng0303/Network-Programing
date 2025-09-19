@@ -85,7 +85,6 @@ class LobbyDB:
             conn.commit()
 
     def report(self, username: str, stats: dict):
-        # update simple counters (xp, coins)
         with self._lock, sqlite3.connect(self.db_path) as conn:
             now = datetime.utcnow().isoformat()
             xp = int(stats.get("xp", 0))
@@ -100,6 +99,32 @@ class LobbyDB:
                   last_seen = excluded.last_seen
             """, (username, xp, coins, now))
             conn.commit()
+
+    def is_online(self, username: str) -> bool:
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT online FROM user_state WHERE username=?", (username,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            return int(row[0]) == 1
+
+    def list_online(self, stale_sec=30):
+        now = datetime.utcnow()
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            # mark stale as offline
+            cur = conn.execute("SELECT username, last_seen FROM user_state WHERE online=1")
+            rows = cur.fetchall()
+            for u, last in rows:
+                try:
+                    last_dt = datetime.fromisoformat(last)
+                except Exception:
+                    last_dt = now
+                if (now - last_dt).total_seconds() > stale_sec:
+                    conn.execute("UPDATE user_state SET online=0 WHERE username=?", (u,))
+            conn.commit()
+            # return current online
+            cur = conn.execute("SELECT username, last_seen, xp, coins FROM user_state WHERE online=1")
+            return [{"username":u, "last_seen":ls, "xp":xp, "coins":coins} for (u,ls,xp,coins) in cur.fetchall()]
 
 class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
@@ -116,7 +141,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                 b = sock.recv(1)
                 if not b:
                     break
-                if b == b"\n":
+                if b == b"\\n":
                     break
                 buf.append(b)
             return b"".join(buf).decode("utf-8") if buf else ""
@@ -140,9 +165,14 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                 u, p = msg.get("username",""), msg.get("password","")
                 ok = self.server.db.verify(u, p)
                 if ok:
+                    if self.server.db.is_online(u):
+                        send({"type":"LOGIN_DUPLICATE"})
+                        continue
                     self.server.db.mark_login(u)
                     username_in_session = u
-                send({"type":"LOGIN_SUCCESS" if ok else "LOGIN_FAIL"})
+                    send({"type":"LOGIN_SUCCESS"})
+                else:
+                    send({"type":"LOGIN_FAIL"})
             elif t == "REPORT":
                 u = msg.get("username","")
                 stats = msg.get("stats", {})
@@ -174,7 +204,7 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.db = db
 
 def main():
-    ap = argparse.ArgumentParser(description="Lobby Server (TCP): REGISTER/LOGIN + REPORT/LOGOUT with persistent DB")
+    ap = argparse.ArgumentParser(description="Lobby Server (TCP): REGISTER/LOGIN + REPORT/LOGOUT/PLAYERS with persistent DB")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7000)
     ap.add_argument("--db", default="lobby.sqlite")
@@ -186,7 +216,7 @@ def main():
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\n[Lobby] Bye.")
+        print("\\n[Lobby] Bye.")
 
 if __name__ == "__main__":
     main()

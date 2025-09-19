@@ -1,12 +1,16 @@
 
-import argparse, socket, json, time, threading, random, sys
+import argparse, socket, json, time, threading, sys
 from typing import List, Tuple
 from protocol import send_json, recv_json, pretty_board
 from game_logic import TicTacToeRecycling
 
-import time, socket
+# -------- TCP Helpers --------
 
 def tcp_connect(host: str, port: int, timeout=5.0) -> socket.socket:
+    """
+    Connect to host:port with AF_INET/AF_INET6 attempts and per-try timeout.
+    After connect, switch to blocking mode for game I/O (no recv timeouts).
+    """
     families = (socket.AF_INET, socket.AF_INET6)
     last_err = None
     deadline = time.monotonic() + timeout
@@ -20,12 +24,12 @@ def tcp_connect(host: str, port: int, timeout=5.0) -> socket.socket:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            per_try = max(0.5, min(3.0, remaining))     
+            per_try = max(0.5, min(3.0, remaining))
             s = socket.socket(fam, socket.SOCK_STREAM)
             s.settimeout(per_try)
             try:
                 s.connect(addr)
-                s.settimeout(None)
+                s.settimeout(None)  # switch to blocking
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 return s
             except OSError as e:
@@ -33,13 +37,14 @@ def tcp_connect(host: str, port: int, timeout=5.0) -> socket.socket:
                 s.close()
     raise (last_err or TimeoutError(f"connect to {host}:{port} failed"))
 
-
 def tcp_request(host: str, port: int, msg: dict) -> dict:
     s = tcp_connect(host, port)
     send_json(s, msg)
     resp = recv_json(s)
     s.close()
     return resp
+
+# -------- Lobby convenience helpers --------
 
 def lobby_register(lobby_host, lobby_port, username, password):
     resp = tcp_request(lobby_host, lobby_port, {"type":"REGISTER","username":username,"password":password})
@@ -62,6 +67,26 @@ def lobby_report(lobby_host, lobby_port, username, xp=0, coins=0):
         print("[Lobby]", resp)
     except Exception as e:
         print("[Lobby] REPORT failed:", e)
+
+def start_heartbeat(lobby_host, lobby_port, username, interval_sec=10):
+    """Background thread that periodically sends REPORT to lobby."""
+    stop_event = threading.Event()
+    def _run():
+        while not stop_event.is_set():
+            try:
+                tcp_request(lobby_host, lobby_port, {
+                    "type":"REPORT",
+                    "username": username,
+                    "stats": {"xp": 0, "coins": 0}
+                })
+            except Exception as e:
+                print("[Heartbeat] REPORT failed:", e)
+            stop_event.wait(interval_sec)
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    return th, stop_event
+
+# -------- UDP / Scan / Invite --------
 
 def parse_hostport(s: str) -> Tuple[str,int]:
     if ":" not in s:
@@ -101,6 +126,18 @@ def cmd_scan(hosts: List[str], ports: List[int], timeout=0.15):
     if not discovered:
         print("[Scan] No waiting players found.")
     return discovered
+
+# -------- Host IP advertise helper --------
+
+def outbound_ip_to(target_host: str) -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((target_host, 9))  # no packets sent
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+# -------- Player roles --------
 
 def cmd_wait(username: str, udp_port: int, auto_accept=False):
     """
@@ -191,7 +228,10 @@ def run_host(username: str, bind_host: str, tcp_port: int, peer_udp: Tuple[str,i
     # notify peer via UDP (send actual port)
     uh, up = peer_udp
     us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    us.sendto(json.dumps({"type":"GAME_TCP","host":bind_host,"port":actual_port}).encode("utf-8"), (uh, up))
+    advertise_host = bind_host
+    if advertise_host in ("0.0.0.0", "127.0.0.1", "localhost"):
+        advertise_host = outbound_ip_to(uh)
+    us.sendto(json.dumps({"type":"GAME_TCP","host":advertise_host,"port":actual_port}).encode("utf-8"), (uh, up))
     us.close()
     # Accept a single peer
     try:
@@ -332,7 +372,7 @@ def prompt_move_guest() -> int:
 
 def cmd_invite(username: str, target_host: str, target_port: int, tcp_bind_host: str, tcp_port: int):
     print(f"[Invite] Sending INVITE to {target_host}:{target_port} ...")
-    ok, addr, resp = udp_send_and_wait(target_host, target_port, {"type":"INVITE","from":username}, timeout=60.0)
+    ok, addr, resp = udp_send_and_wait(target_host, target_port, {"type":"INVITE","from":username}, timeout=3.0)
     if not ok or not resp:
         print("[Invite] Declined or timeout.")
         return
@@ -373,6 +413,8 @@ def cmd_match(username: str, hosts: List[str], ports: List[int], tcp_bind_host: 
             else:
                 print(f"[Match] Declined by {t}.")
 
+# -------- CLI --------
+
 def main():
     ap = argparse.ArgumentParser(description="Player client (login/scan/wait/invite/match/game)")
     ap.add_argument("--lobby", help="host:port of lobby", default=None)
@@ -410,7 +452,7 @@ def main():
 
     args = ap.parse_args()
 
-    # lobby host:port parse if needed
+    # Commands that need lobby immediately
     lobby_host = lobby_port = None
     if args.cmd in ("register","login","logout","report"):
         if not args.lobby:
@@ -437,7 +479,32 @@ def main():
         lobby_report(lobby_host, lobby_port, args.username, xp=args.xp, coins=args.coins)
 
     elif args.cmd == "wait":
-        cmd_wait(args.username, args.udp_port, auto_accept=args.auto_accept)
+        # Enforce login first
+        if not args.lobby or not args.password:
+            print("This command requires --lobby host:port and --password to login first.")
+            sys.exit(1)
+        lobby_host, lobby_port = parse_hostport(args.lobby)
+        resp = tcp_request(lobby_host, lobby_port, {"type":"LOGIN","username":args.username,"password":args.password})
+        if resp.get("type") == "LOGIN_DUPLICATE":
+            print("[Lobby] LOGIN_DUPLICATE: this account is already online. Abort.")
+            sys.exit(1)
+        if resp.get("type") != "LOGIN_SUCCESS":
+            print("[Lobby] LOGIN failed:", resp)
+            sys.exit(1)
+        print("[Lobby] LOGIN_SUCCESS")
+
+        hb, stop = start_heartbeat(lobby_host, lobby_port, args.username, interval_sec=10)
+        print("[Heartbeat] started (10s).")
+        try:
+            cmd_wait(args.username, args.udp_port, auto_accept=args.auto_accept)
+        finally:
+            try:
+                stop.set()
+                hb.join(timeout=1)
+                out = tcp_request(lobby_host, lobby_port, {"type":"LOGOUT","username":args.username})
+                print("[Lobby]", out)
+            except Exception as e:
+                print("[Lobby] LOGOUT failed:", e)
 
     elif args.cmd == "scan":
         hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
@@ -449,9 +516,34 @@ def main():
         cmd_invite(args.username, th, tp, args.tcp_bind_host, args.tcp_port)
 
     elif args.cmd == "match":
-        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
-        ports = parse_ports(args.ports)
-        cmd_match(args.username, hosts, ports, args.tcp_bind_host, args.tcp_port, args.timeout)
+        # Enforce login first
+        if not args.lobby or not args.password:
+            print("This command requires --lobby host:port and --password to login first.")
+            sys.exit(1)
+        lobby_host, lobby_port = parse_hostport(args.lobby)
+        resp = tcp_request(lobby_host, lobby_port, {"type":"LOGIN","username":args.username,"password":args.password})
+        if resp.get("type") == "LOGIN_DUPLICATE":
+            print("[Lobby] LOGIN_DUPLICATE: this account is already online. Abort.")
+            sys.exit(1)
+        if resp.get("type") != "LOGIN_SUCCESS":
+            print("[Lobby] LOGIN failed:", resp)
+            sys.exit(1)
+        print("[Lobby] LOGIN_SUCCESS")
+
+        hb, stop = start_heartbeat(lobby_host, lobby_port, args.username, interval_sec=10)
+        print("[Heartbeat] started (10s).")
+        try:
+            hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+            ports = parse_ports(args.ports)
+            cmd_match(args.username, hosts, ports, args.tcp_bind_host, args.tcp_port, args.timeout)
+        finally:
+            try:
+                stop.set()
+                hb.join(timeout=1)
+                out = tcp_request(lobby_host, lobby_port, {"type":"LOGOUT","username":args.username})
+                print("[Lobby]", out)
+            except Exception as e:
+                print("[Lobby] LOGOUT failed:", e)
 
 if __name__ == "__main__":
     main()
