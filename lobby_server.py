@@ -167,11 +167,12 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
             except json.JSONDecodeError:
                 send({"type":"ERROR","reason":"invalid_json"})
                 continue
+            
+
+            t = msg.get("type")
             if getattr(self.server, "verbose", False):
                 who = msg.get("username", "?")
                 print(f"[Lobby] {self.client_address} -> {t} ({who})")
-
-            t = msg.get("type")
             if t == "REGISTER":
                 ok = self.server.db.register(msg.get("username",""), msg.get("password",""))
                 send({"type":"REGISTER_OK" if ok else "REGISTER_TAKEN"})
