@@ -153,6 +153,9 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                 self.server.db.mark_logout(u)
                 send({"type":"LOGOUT_OK"})
                 break
+            elif t == "PLAYERS":
+                online = self.server.db.list_online()
+                send({"type":"PLAYERS_OK","online": online})
             else:
                 send({"type":"ERROR","reason":"unknown_type"})
                 break

@@ -4,11 +4,35 @@ from typing import List, Tuple
 from protocol import send_json, recv_json, pretty_board
 from game_logic import TicTacToeRecycling
 
+import time, socket
+
 def tcp_connect(host: str, port: int, timeout=5.0) -> socket.socket:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    s.connect((host, port))
-    return s
+    families = (socket.AF_INET, socket.AF_INET6)
+    last_err = None
+    deadline = time.monotonic() + timeout
+    for fam in families:
+        try:
+            infos = socket.getaddrinfo(host, port, fam, socket.SOCK_STREAM)
+        except OSError as e:
+            last_err = e
+            continue
+        for *_, addr in infos:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            per_try = max(0.5, min(3.0, remaining))     
+            s = socket.socket(fam, socket.SOCK_STREAM)
+            s.settimeout(per_try)
+            try:
+                s.connect(addr)
+                s.settimeout(None)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                return s
+            except OSError as e:
+                last_err = e
+                s.close()
+    raise (last_err or TimeoutError(f"connect to {host}:{port} failed"))
+
 
 def tcp_request(host: str, port: int, msg: dict) -> dict:
     s = tcp_connect(host, port)
@@ -308,7 +332,7 @@ def prompt_move_guest() -> int:
 
 def cmd_invite(username: str, target_host: str, target_port: int, tcp_bind_host: str, tcp_port: int):
     print(f"[Invite] Sending INVITE to {target_host}:{target_port} ...")
-    ok, addr, resp = udp_send_and_wait(target_host, target_port, {"type":"INVITE","from":username}, timeout=3.0)
+    ok, addr, resp = udp_send_and_wait(target_host, target_port, {"type":"INVITE","from":username}, timeout=60.0)
     if not ok or not resp:
         print("[Invite] Declined or timeout.")
         return
