@@ -167,6 +167,10 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
             except json.JSONDecodeError:
                 send({"type":"ERROR","reason":"invalid_json"})
                 continue
+            if getattr(self.server, "verbose", False):
+                who = msg.get("username", "?")
+                print(f"[Lobby] {self.client_address} -> {t} ({who})")
+
             t = msg.get("type")
             if t == "REGISTER":
                 ok = self.server.db.register(msg.get("username",""), msg.get("password",""))
@@ -196,6 +200,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
             elif t == "PLAYERS":
                 online = self.server.db.list_online()
                 send({"type":"PLAYERS_OK","online": online})
+            
             else:
                 send({"type":"ERROR","reason":"unknown_type"})
                 break
@@ -218,10 +223,13 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7000)
     ap.add_argument("--db", default="lobby.sqlite")
+    ap.add_argument("--verbose", action="store_true")
+
     args = ap.parse_args()
 
     db = LobbyDB(args.db)
     srv = ThreadedTCPServer((args.host, args.port), ThreadedTCPRequestHandler, db)
+    srv.verbose = args.verbose
     print(f"[Lobby] Listening on {args.host}:{args.port}, DB={args.db}")
     try:
         srv.serve_forever()
