@@ -136,20 +136,30 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
             sock.sendall(data.encode("utf-8"))
 
         def recv_line():
-            buf = []
+            buf = bytearray()
             while True:
-                b = sock.recv(1)
+                try:
+                    b = sock.recv(1)
+                except (ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
+                    return ""
                 if not b:
+                    
+                    return ""
+                if b == b"\n":
                     break
-                if b == b"\\n":
+                buf += b
+                if len(buf) > 65536:
                     break
-                buf.append(b)
-            return b"".join(buf).decode("utf-8") if buf else ""
+            
+            return bytes(buf).decode("utf-8", errors="replace").rstrip("\r")
+
 
         username_in_session = None
 
         while True:
             line = recv_line()
+            if line == "":
+                break
             if not line:
                 break
             try:
