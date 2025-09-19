@@ -470,6 +470,7 @@ def main():
         if not args.password:
             print("Use --password for login")
             sys.exit(1)
+        resp = tcp_request(lobby_host, lobby_port, {"type":"LOGIN","username":args.username,"password":args.password})
         if resp.get("type") == "LOGIN_DUPLICATE":
             print("[Lobby] LOGIN_DUPLICATE: this account is already online. Abort.")
             sys.exit(1)
