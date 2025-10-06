@@ -1,4 +1,3 @@
-
 import argparse
 import socketserver
 import threading
@@ -46,9 +45,14 @@ class LobbyDB:
         created = datetime.utcnow().isoformat()
         with self._lock, sqlite3.connect(self.db_path) as conn:
             try:
-                conn.execute("INSERT INTO users(username, password_hash, salt, created_at) VALUES(?,?,?,?)",
-                             (username, pw_hash, salt, created))
-                conn.execute("INSERT OR IGNORE INTO user_state(username,last_seen) VALUES(?,?)", (username, created))
+                conn.execute(
+                    "INSERT INTO users(username, password_hash, salt, created_at) VALUES(?,?,?,?)",
+                    (username, pw_hash, salt, created),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO user_state(username,last_seen) VALUES(?,?)",
+                    (username, created),
+                )
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
@@ -56,7 +60,9 @@ class LobbyDB:
 
     def verify(self, username: str, password: str) -> bool:
         with self._lock, sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT password_hash, salt FROM users WHERE username=?", (username,))
+            cur = conn.execute(
+                "SELECT password_hash, salt FROM users WHERE username=?", (username,)
+            )
             row = cur.fetchone()
             if not row:
                 return False
@@ -66,22 +72,26 @@ class LobbyDB:
     def mark_login(self, username: str):
         with self._lock, sqlite3.connect(self.db_path) as conn:
             now = datetime.utcnow().isoformat()
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO user_state(username, login_count, online, last_seen)
                 VALUES(?,1,1,?)
                 ON CONFLICT(username) DO UPDATE SET
                   login_count = login_count + 1,
                   online = 1,
                   last_seen = excluded.last_seen
-            """, (username, now))
+                """,
+                (username, now),
+            )
             conn.commit()
 
     def mark_logout(self, username: str):
         with self._lock, sqlite3.connect(self.db_path) as conn:
             now = datetime.utcnow().isoformat()
-            conn.execute("""
-                UPDATE user_state SET online=0, last_seen=? WHERE username=?
-            """, (now, username))
+            conn.execute(
+                "UPDATE user_state SET online=0, last_seen=? WHERE username=?",
+                (now, username),
+            )
             conn.commit()
 
     def report(self, username: str, stats: dict):
@@ -89,7 +99,8 @@ class LobbyDB:
             now = datetime.utcnow().isoformat()
             xp = int(stats.get("xp", 0))
             coins = int(stats.get("coins", 0))
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO user_state(username, xp, coins, online, last_seen)
                 VALUES(?,?,?,1,?)
                 ON CONFLICT(username) DO UPDATE SET
@@ -97,12 +108,16 @@ class LobbyDB:
                   coins = excluded.coins,
                   online = 1,
                   last_seen = excluded.last_seen
-            """, (username, xp, coins, now))
+                """,
+                (username, xp, coins, now),
+            )
             conn.commit()
 
     def is_online(self, username: str) -> bool:
         with self._lock, sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT online FROM user_state WHERE username=?", (username,))
+            cur = conn.execute(
+                "SELECT online FROM user_state WHERE username=?", (username,)
+            )
             row = cur.fetchone()
             if not row:
                 return False
@@ -112,7 +127,9 @@ class LobbyDB:
         now = datetime.utcnow()
         with self._lock, sqlite3.connect(self.db_path) as conn:
             # mark stale as offline
-            cur = conn.execute("SELECT username, last_seen FROM user_state WHERE online=1")
+            cur = conn.execute(
+                "SELECT username, last_seen FROM user_state WHERE online=1"
+            )
             rows = cur.fetchall()
             for u, last in rows:
                 try:
@@ -120,11 +137,19 @@ class LobbyDB:
                 except Exception:
                     last_dt = now
                 if (now - last_dt).total_seconds() > stale_sec:
-                    conn.execute("UPDATE user_state SET online=0 WHERE username=?", (u,))
+                    conn.execute(
+                        "UPDATE user_state SET online=0 WHERE username=?", (u,)
+                    )
             conn.commit()
             # return current online
-            cur = conn.execute("SELECT username, last_seen, xp, coins FROM user_state WHERE online=1")
-            return [{"username":u, "last_seen":ls, "xp":xp, "coins":coins} for (u,ls,xp,coins) in cur.fetchall()]
+            cur = conn.execute(
+                "SELECT username, last_seen, xp, coins FROM user_state WHERE online=1"
+            )
+            return [
+                {"username": u, "last_seen": ls, "xp": xp, "coins": coins}
+                for (u, ls, xp, coins) in cur.fetchall()
+            ]
+
 
 class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
@@ -141,70 +166,95 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                 try:
                     b = sock.recv(1)
                 except (ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
+                    # 對方重置/中止/逾時：當成對方走人
                     return ""
                 if not b:
-                    
+                    # 對方正常關閉
                     return ""
                 if b == b"\n":
                     break
                 buf += b
-                if len(buf) > 65536:
+                if len(buf) > 65536:  # 避免惡意超長
                     break
-            
+            # 支援 CRLF
             return bytes(buf).decode("utf-8", errors="replace").rstrip("\r")
-
 
         username_in_session = None
 
         while True:
             line = recv_line()
-            if line == "":
-                break
             if not line:
+                # 空行或斷線
+                if getattr(self.server, "verbose", False):
+                    print(f"[Lobby] {self.client_address} disconnected/empty")
                 break
+
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
-                send({"type":"ERROR","reason":"invalid_json"})
+                send({"type": "ERROR", "reason": "invalid_json"})
                 continue
-            
 
             t = msg.get("type")
             if getattr(self.server, "verbose", False):
                 who = msg.get("username", "?")
                 print(f"[Lobby] {self.client_address} -> {t} ({who})")
+
             if t == "REGISTER":
-                ok = self.server.db.register(msg.get("username",""), msg.get("password",""))
-                send({"type":"REGISTER_OK" if ok else "REGISTER_TAKEN"})
+                ok = self.server.db.register(
+                    msg.get("username", ""), msg.get("password", "")
+                )
+                send({"type": "REGISTER_OK" if ok else "REGISTER_TAKEN"})
+
             elif t == "LOGIN":
-                u, p = msg.get("username",""), msg.get("password","")
+                u, p = msg.get("username", ""), msg.get("password", "")
                 ok = self.server.db.verify(u, p)
                 if ok:
                     if self.server.db.is_online(u):
-                        send({"type":"LOGIN_DUPLICATE"})
+                        send({"type": "LOGIN_DUPLICATE"})
                         continue
                     self.server.db.mark_login(u)
+                    # 取回玩家狀態
+                    with sqlite3.connect(self.server.db.db_path) as conn:
+                        cur = conn.execute(
+                            "SELECT login_count, xp, coins FROM user_state WHERE username=?",
+                            (u,),
+                        )
+                        row = cur.fetchone() or (0, 0, 0)
                     username_in_session = u
-                    send({"type":"LOGIN_SUCCESS"})
+                    send(
+                        {
+                            "type": "LOGIN_SUCCESS",
+                            "profile": {
+                                "login_count": row[0],
+                                "xp": row[1],
+                                "coins": row[2],
+                            },
+                        }
+                    )
                 else:
-                    send({"type":"LOGIN_FAIL"})
+                    send({"type": "LOGIN_FAIL"})
+
             elif t == "REPORT":
-                u = msg.get("username","")
+                u = msg.get("username", "")
                 stats = msg.get("stats", {})
                 self.server.db.report(u, stats)
-                send({"type":"REPORT_OK"})
+                send({"type": "REPORT_OK"})
+
             elif t == "LOGOUT":
-                u = msg.get("username","")
+                u = msg.get("username", "")
                 self.server.db.mark_logout(u)
-                send({"type":"LOGOUT_OK"})
+                send({"type": "LOGOUT_OK"})
                 break
+
             elif t == "PLAYERS":
                 online = self.server.db.list_online()
-                send({"type":"PLAYERS_OK","online": online})
-            
+                send({"type": "PLAYERS_OK", "online": online})
+
             else:
-                send({"type":"ERROR","reason":"unknown_type"})
+                send({"type": "ERROR", "reason": "unknown_type"})
                 break
+
         # best-effort logout on disconnect
         if username_in_session:
             try:
@@ -212,20 +262,24 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
             except Exception:
                 pass
 
+
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
+
     def __init__(self, server_address, RequestHandlerClass, db: LobbyDB):
         super().__init__(server_address, RequestHandlerClass)
         self.db = db
 
+
 def main():
-    ap = argparse.ArgumentParser(description="Lobby Server (TCP): REGISTER/LOGIN + REPORT/LOGOUT/PLAYERS with persistent DB")
+    ap = argparse.ArgumentParser(
+        description="Lobby Server (TCP): REGISTER/LOGIN + REPORT/LOGOUT/PLAYERS with persistent DB"
+    )
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7000)
     ap.add_argument("--db", default="lobby.sqlite")
     ap.add_argument("--verbose", action="store_true")
-
     args = ap.parse_args()
 
     db = LobbyDB(args.db)
@@ -235,7 +289,8 @@ def main():
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\\n[Lobby] Bye.")
+        print("\n[Lobby] Bye.")
+
 
 if __name__ == "__main__":
     main()
