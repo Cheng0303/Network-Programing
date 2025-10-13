@@ -210,6 +210,22 @@ def cmd_wait(username: str, udp_port: int, auto_accept=False):
         except Exception:
             pass
 
+
+def is_same_machine(peer_host: str) -> bool:
+    try:
+        peer_ip = socket.gethostbyname(peer_host)
+        # 讓 OS 幫你選「對 peer_ip 出口」時會用的本機 IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((peer_ip, 9))  # 不會真的送封包
+            local_ip = s.getsockname()[0]
+        finally:
+            s.close()
+        # 同機的常見情況：local_ip 會等於 peer_ip（或 peer 是 loopback）
+        return peer_ip == local_ip or peer_ip == "127.0.0.1"
+    except Exception:
+        return False
+
 def run_host(username: str, bind_host: str, tcp_port: int, peer_udp: Tuple[str,int]):
     """
     Host a TCP server for the game. If the requested tcp_port is busy, automatically
@@ -229,7 +245,10 @@ def run_host(username: str, bind_host: str, tcp_port: int, peer_udp: Tuple[str,i
     uh, up = peer_udp
     us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     advertise_host = bind_host
-    if advertise_host in ("0.0.0.0", "127.0.0.1", "localhost"):
+    if is_same_machine(uh):
+    # 同一台機器 → 直接告知 127.0.0.1，避免 0.0.0.0 / 外部 IP 造成失敗
+        advertise_host = "127.0.0.1"
+    elif advertise_host in ("0.0.0.0", "127.0.0.1", "localhost"):
         advertise_host = outbound_ip_to(uh)
     us.sendto(json.dumps({"type":"GAME_TCP","host":advertise_host,"port":actual_port}).encode("utf-8"), (uh, up))
     us.close()
