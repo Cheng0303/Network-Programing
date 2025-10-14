@@ -55,6 +55,8 @@ def lobby_login(lobby_host, lobby_port, username, password):
     if resp and resp.get("type") == "LOGIN_SUCCESS" and "profile" in resp:
         p = resp["profile"]
         print(f"[Profile] login_count={p.get('login_count')}, xp={p.get('xp')}, coins={p.get('coins')}")
+    
+    return resp
 
 def lobby_logout(lobby_host, lobby_port, username):
     try:
@@ -480,11 +482,14 @@ def main():
         if not args.password:
             print("Use --password for login")
             sys.exit(1)
-        resp = tcp_request(lobby_host, lobby_port, {"type":"LOGIN","username":args.username,"password":args.password})
-        if resp and resp.get("type") == "LOGIN_DUPLICATE":
+      
+        resp = lobby_login(lobby_host, lobby_port, args.username, args.password)
+        if not resp:
+            sys.exit(1)
+        if resp.get("type") == "LOGIN_DUPLICATE":
             print("[Lobby] LOGIN_DUPLICATE: this account is already online. Abort.")
             sys.exit(1)
-        lobby_login(lobby_host, lobby_port, args.username, args.password)
+        sys.exit(0 if resp.get("type") == "LOGIN_SUCCESS" else 1)
 
     elif args.cmd == "logout":
         lobby_logout(lobby_host, lobby_port, args.username)
