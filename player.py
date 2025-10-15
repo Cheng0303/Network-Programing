@@ -415,7 +415,7 @@ def cmd_match(username: str, hosts: List[str], ports: List[int], tcp_bind_host: 
         for t in targets:
             th, tp = parse_hostport(t)
             print(f"[Match] Trying invite -> {t}")
-            ok, addr, resp = udp_send_and_wait(th, tp, {"type":"INVITE","from":username}, timeout=3.0)
+            ok, addr, resp = udp_send_and_wait(th, tp, {"type":"INVITE","from":username}, timeout=60.0)
             tried_recent.add(t)
             if not ok or not resp:
                 print(f"[Match] {t} no response/timeout.")
